@@ -2607,6 +2607,8 @@ The `token_endpoint_auth_methods_supported` client metadata property is processe
 
 When displaying a client's `logo_uri`, applications must prefetch and validate the image and serve it from a trusted server. Applications should display the hostname of the Client Identifier URL to help users identify the client and apply their own trust policies to client-provided metadata.
 
+Fetched metadata documents are cached per provider according to the response's HTTP cache headers, bounded by `cacheDuration`. Responses that explicitly declare no caching (`Cache-Control: no-cache`, `no-store`, or `max-age=0`) are not cached at all, every resolution fetches the document from its origin. A cached document can be invalidated ahead of its TTL with the `invalidateClientMetadataDocument(provider, clientId)` helper exported from `lib/helpers/client_id_metadata_document.js`: it drops the cached entry, discards any in-flight fetch for the identifier, and the next resolution fetches the document from its origin again. Invalidating an uncached or unknown identifier is a no-op.
+
 
 
 
@@ -2659,7 +2661,7 @@ async function allowFetch(
 
 #### cacheDuration
 
-Specifies the minimum and maximum cache duration bounds (in seconds) applied to HTTP cache headers when caching fetched Client ID Metadata Documents. Cache-Control and Expires response headers are respected within these bounds.
+Specifies the minimum and maximum cache duration bounds (in seconds) applied to HTTP cache headers when caching fetched Client ID Metadata Documents. Cache-Control and Expires response headers are respected within these bounds. Responses explicitly declaring no caching (`Cache-Control: no-cache`, `no-store`, or `max-age=0`) bypass the cache entirely, the minimum bound does not apply to them.
 
 
 _**default value**_:

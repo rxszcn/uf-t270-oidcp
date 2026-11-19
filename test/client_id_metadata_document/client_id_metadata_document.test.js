@@ -6,6 +6,7 @@ import bootstrap, { mock } from '../test_helper.js';
 import Provider from '../../lib/index.js';
 import als from '../../lib/helpers/als.js';
 import {
+  invalidateClientMetadataDocument,
   isValidClientIdUrl,
   resolveClientByMetadataDocument,
 } from '../../lib/helpers/client_id_metadata_document.js';
@@ -34,11 +35,21 @@ function createProvider(feature = {}, configuration = {}) {
         ...feature,
       },
     },
-    fetch: (url, options) => {
+    fetch: configuration.fetch ?? ((url, options) => {
       delete options.dispatcher;
       return globalThis.fetch(url, options);
-    },
+    }),
   });
+}
+
+// Counts outbound metadata document fetches while delegating to the mocked
+// global fetch, used to read the pull-from-origin count of a scenario.
+function countingFetch(counter) {
+  return (url, options) => {
+    counter.count += 1;
+    delete options.dispatcher;
+    return globalThis.fetch(url, options);
+  };
 }
 
 function resolve(provider, id, ctx = {}) {
@@ -1015,6 +1026,118 @@ describe('Client ID Metadata Document', () => {
 
       assert.equal((await resolve(firstProvider, id)).clientName, 'first provider');
       assert.equal((await resolve(secondProvider, id)).clientName, 'second provider');
+    });
+
+    it('does not cache documents whose response declares no caching', { timeout: 3000 }, async () => {
+      for (const [directive, host] of [
+        ['no-store', 'no-store.example.com'],
+        ['no-cache', 'no-cache.example.com'],
+        ['max-age=0', 'zero-max-age.example.com'],
+      ]) {
+        const counter = { count: 0 };
+        const provider = createProvider({}, { fetch: countingFetch(counter) });
+        const id = `https://${host}/client`;
+        const url = new URL(id);
+        for (const clientName of ['first', 'second']) {
+          mock(url.origin)
+            .intercept({ path: url.pathname })
+            .reply(200, JSON.stringify({
+              client_id: id,
+              redirect_uris: ['https://client.example.com/cb'],
+              token_endpoint_auth_method: 'none',
+              client_name: clientName,
+            }), {
+              headers: {
+                'content-type': 'application/json',
+                'cache-control': directive,
+              },
+            });
+        }
+
+        assert.equal((await resolve(provider, id)).clientName, 'first');
+        // the no-caching declaration is not lifted by the cacheDuration min
+        // bound, the second request pulls from the origin again
+        assert.equal((await resolve(provider, id)).clientName, 'second');
+        assert.equal(counter.count, 2);
+      }
+    });
+  });
+
+  describe('metadata document cache invalidation', () => {
+    it('pulls the document from its origin right after invalidation', { timeout: 3000 }, async () => {
+      const counter = { count: 0 };
+      const provider = createProvider({}, { fetch: countingFetch(counter) });
+      const id = 'https://invalidated.example.com/client';
+      mockMetadata(id, { client_name: 'first' });
+
+      assert.equal((await resolve(provider, id)).clientName, 'first');
+      await resolve(provider, id); // served from cache
+      assert.equal(counter.count, 1);
+
+      assert.equal(invalidateClientMetadataDocument(provider, id), true);
+
+      mockMetadata(id, { client_name: 'refreshed' });
+      assert.equal((await resolve(provider, id)).clientName, 'refreshed');
+      // the outbound pull count grew by at least one after the invalidation
+      assert.ok(counter.count >= 2);
+    });
+
+    it('does not amplify outbound fetches on repeated invalidations', { timeout: 3000 }, async () => {
+      const counter = { count: 0 };
+      const provider = createProvider({}, { fetch: countingFetch(counter) });
+      const id = 'https://repeated-invalidation.example.com/client';
+      mockMetadata(id);
+
+      await resolve(provider, id);
+      assert.equal(counter.count, 1);
+
+      assert.equal(invalidateClientMetadataDocument(provider, id), true);
+      assert.equal(invalidateClientMetadataDocument(provider, id), false);
+      // repeated invalidations without intervening requests trigger no outbound pull
+      assert.equal(counter.count, 1);
+    });
+
+    it('treats invalidating an uncached or unknown identifier as a no-op', { timeout: 3000 }, async () => {
+      const counter = { count: 0 };
+      const provider = createProvider({}, { fetch: countingFetch(counter) });
+      const id = 'https://unknown-invalidation.example.com/client';
+
+      assert.equal(invalidateClientMetadataDocument(provider, id), false);
+      assert.equal(counter.count, 0);
+
+      mockMetadata(id, { client_name: 'fetched' });
+      assert.equal((await resolve(provider, id)).clientName, 'fetched');
+      assert.equal(counter.count, 1);
+    });
+
+    it('discards in-flight fetches invalidated before they settle', { timeout: 3000 }, async () => {
+      const counter = { count: 0 };
+      const provider = createProvider({}, { fetch: countingFetch(counter) });
+      const id = 'https://inflight-invalidation.example.com/client';
+      mockMetadata(id, { client_name: 'stale' }).delay(50);
+
+      const settled = resolve(provider, id);
+      while (counter.count === 0) {
+        await new Promise((wait) => { setImmediate(wait); });
+      }
+
+      // the invalidation lands while the first fetch is still in flight
+      assert.equal(invalidateClientMetadataDocument(provider, id), true);
+
+      mockMetadata(id, { client_name: 'fresh' });
+      const [stale, fresh] = await Promise.all([
+        settled,
+        resolve(provider, id),
+      ]);
+
+      // the in-flight request still settles for its awaiters ...
+      assert.equal(stale.clientName, 'stale');
+      // ... but its stale result is not cached, the next resolution pulled again
+      assert.equal(fresh.clientName, 'fresh');
+      assert.equal(counter.count, 2);
+
+      await resolve(provider, id); // served from the fresh cache entry
+      assert.equal(counter.count, 2);
     });
   });
 
